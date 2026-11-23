@@ -1,0 +1,1 @@
+v0.3: Adaptive edge-based navigation. Compare central map region before and after swipe; require two consecutive no-movement checks for horizontal edge; switch direction after vertical movement. Stop if vertical movement cannot be detected. Threshold is heuristic and requires testing on the game.
