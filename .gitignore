@@ -7,3 +7,7 @@ local.properties
 *.keystore
 .idea/
 *.iml
+
+.kotlin/
+
+.kotlin/

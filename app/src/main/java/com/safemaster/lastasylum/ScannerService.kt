@@ -60,6 +60,9 @@ class ScannerService : AccessibilityService() {
  private var zoomCenterY=0f
  private data class Candidate(val x:Float,val y:Float,val name:String,val level:Int,val kind:Int)
  private var pendingCandidates=mutableListOf<Candidate>()
+ private var verificationAttempts=0
+ private var lastCandidateAnchorX=0f
+ private var lastCandidateAnchorY=0f
  private var allowedKinds=setOf(0,1,2) // 0 blue, 1 red, 2 white
  private var zoomStep=0
  private val maxZoomSteps=3
@@ -138,7 +141,7 @@ class ScannerService : AccessibilityService() {
  private fun report(message:String) { status=message; lastLog=message; val time=SimpleDateFormat("HH:mm:ss",Locale.getDefault()).format(Date()); journal.addLast("$time | $message"); while(journal.size>120) journal.removeFirst(); updateOverlay() }
  fun diagnostics():String = journal.joinToString("\n")
  private fun stopWith(reason:String) { running=false; busy=false; previousSample=null; checkingMovement=false; pendingDiagnosticBefore?.recycle(); pendingDiagnosticBefore=null; report(reason); Toast.makeText(this,reason,Toast.LENGTH_LONG).show() }
- private fun resetNavigation() { pendingCandidates.clear(); savedCandidate=null; zoomStep=0; centered=false; zoomScale=1f; pendingGesture=false; uncertainMoves=0; movementSamples.clear(); baselineSample=null; restoreRetries=0; moveRetries=0; phase=0; noMotion=0; zoomHits=0; step=0; rowSteps=0; verticalNoMotion=0; direction=1; edgeCount=0; row=0; previousSample=null; checkingMovement=false; verticalCheck=false; horizontalStillChecks=0; verticalStillChecks=0; confirmedHorizontalMoves=0; attemptedHorizontalMoves=0; awaitingMotion=false; diagnosticChecks=0; diagnosticPair=0; pendingDiagnosticBefore?.recycle(); pendingDiagnosticBefore=null; diagnosticVerticalDone=false; uncertainHorizontal=0; uncertainVertical=0; verticalTransitionPending=false; edgeProbeStage=0; recoveryCycles=0; recoveryGestureCount=0; edgeEvidence=0; probeReverseChanged=false }
+ private fun resetNavigation() { pendingCandidates.clear(); verificationAttempts=0; savedCandidate=null; zoomStep=0; centered=false; zoomScale=1f; pendingGesture=false; uncertainMoves=0; movementSamples.clear(); baselineSample=null; restoreRetries=0; moveRetries=0; phase=0; noMotion=0; zoomHits=0; step=0; rowSteps=0; verticalNoMotion=0; direction=1; edgeCount=0; row=0; previousSample=null; checkingMovement=false; verticalCheck=false; horizontalStillChecks=0; verticalStillChecks=0; confirmedHorizontalMoves=0; attemptedHorizontalMoves=0; awaitingMotion=false; diagnosticChecks=0; diagnosticPair=0; pendingDiagnosticBefore?.recycle(); pendingDiagnosticBefore=null; diagnosticVerticalDone=false; uncertainHorizontal=0; uncertainVertical=0; verticalTransitionPending=false; edgeProbeStage=0; recoveryCycles=0; recoveryGestureCount=0; edgeEvidence=0; probeReverseChanged=false }
  private fun scan() {
   if(!running || busy) return
   busy=true
@@ -178,53 +181,55 @@ class ScannerService : AccessibilityService() {
         if(!running) return@post
         when(phase) {
          0 -> {
-          if(pendingCandidates.isEmpty()) pendingCandidates.addAll(findCandidates(blocks))
+          if(pendingCandidates.isEmpty()) {
+           pendingCandidates.addAll(findCandidates(blocks).take(24))
+           if(pendingCandidates.isNotEmpty()) report("Кандидатов на текущем экране: ${pendingCandidates.size}")
+          }
           if(pendingCandidates.isNotEmpty()) {
            val candidate=pendingCandidates.removeAt(0)
            candidateX=candidate.x; candidateY=candidate.y; savedCandidate=candidate
+           lastCandidateAnchorX=candidate.x; lastCandidateAnchorY=candidate.y
            candidateKey="${row}:${direction}:${step}:${(candidateX/55).toInt()}:${(candidateY/55).toInt()}"
            if(searchMode==1 && candidate.level==targetLevel) found()
            else if(searchMode==2 && namesMatch(candidate.name,target) && candidate.level==targetLevel) found()
            else if(searchMode==0 && namesMatch(candidate.name,target) && candidate.level==targetLevel) found()
            else if(searchMode==2) { rejected.add(candidateKey); handler.postDelayed({scan()},250) }
            else {
-            baselineSample=sample.copyOf(); restoreRetries=0; zoomStep=0; centered=false
-            phase=1; zoomHits=0; status="Центрирование цели; очередь: ${pendingCandidates.size}"
-            centerTarget(candidateX,candidateY)
+            baselineSample=sample.copyOf(); restoreRetries=0; zoomStep=0; centered=true; verificationAttempts=0
+            // Any zoom invalidates other candidates' screen coordinates. Re-detect on return.
+            pendingCandidates.clear()
+            phase=1; zoomHits=0; status="Проверяю кандидата без перемещения карты"
+            performPinch(candidateX,candidateY,true)
            }
           } else navigate(sample)
          }
          1 -> {
-          val located=locateCandidate(blocks,savedCandidate)
-          if(located!=null) { candidateX=located.x; candidateY=located.y }
-          val matched=hasNameNear(blocks,candidateX,candidateY) && hasExpectedLevelNear(blocks,candidateX,candidateY)
+          verificationAttempts++
+          // Keep the zoom anchor fixed; never chase OCR boxes across a busy map.
+          val matched=hasNameNear(blocks,lastCandidateAnchorX,lastCandidateAnchorY) &&
+           hasExpectedLevelNear(blocks,lastCandidateAnchorX,lastCandidateAnchorY)
           if(matched) {
            zoomHits++
            if(zoomHits>=2) found() else handler.postDelayed({scan()},500)
-          } else if(!centered) {
-           centered=true
-           if(located!=null) centerTarget(candidateX,candidateY) else performPinch(width*.50f,height*.51f,true)
-          } else if(zoomStep<maxZoomSteps) {
-           if(located!=null && (abs(candidateX-width*.5f)>width*.14f || abs(candidateY-height*.51f)>height*.14f)) centerTarget(candidateX,candidateY)
-           else performPinch(width*.5f,height*.51f,true)
+          } else if(zoomStep<maxZoomSteps && verificationAttempts<maxZoomSteps+3) {
+           zoomHits=0
+           performPinch(lastCandidateAnchorX,lastCandidateAnchorY,true)
           } else {
-           rejected.add(candidateKey); phase=2; status="Восстановление обзора"
-           performPinch(width*.5f,height*.51f,false)
+           rejected.add(candidateKey); phase=2; status="Кандидат не подтверждён; возвращаю обзор"
+           if(zoomStep>0) performPinch(lastCandidateAnchorX,lastCandidateAnchorY,false)
+           else handler.postDelayed({scan()},250)
           }
          }
          else -> {
           if(zoomStep>0) {
            status="Возврат масштаба: осталось $zoomStep"
-           performPinch(width*.5f,height*.51f,false)
+           performPinch(lastCandidateAnchorX,lastCandidateAnchorY,false)
           } else {
+           pendingCandidates.clear()
            phase=0; baselineSample=null; previousSample=null; checkingMovement=false
            // The original camera offset may differ after pinch; stop rather than silently drift.
-           if(restoreRetries>0) {
-            running=false; status="Проверьте положение карты после возврата масштаба"; updateOverlay()
-           } else {
-            status="Следующая цель: ${pendingCandidates.size}"
-            handler.postDelayed({scan()},moveDelayMs)
-           }
+           status="Обзор восстановлен; повторное обнаружение объектов"
+           handler.postDelayed({scan()},moveDelayMs)
           }
          }
         }
@@ -268,6 +273,7 @@ class ScannerService : AccessibilityService() {
    result.add(Candidate(cx,cy,name,level,-1))
   }
   return result.distinctBy { Pair((it.x/55).toInt(),(it.y/55).toInt()) }
+   .sortedWith(compareBy<Candidate> { it.y }.thenBy { it.x })
  }
  private fun hasExpectedLevelNear(lines:List<Pair<String,Rect>>,x:Float,y:Float):Boolean {
   val levels=lines.filter { (t,r) ->
