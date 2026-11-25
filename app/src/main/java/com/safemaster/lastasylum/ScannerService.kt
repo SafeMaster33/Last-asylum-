@@ -3,7 +3,7 @@ package com.safemaster.lastasylum
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Bitmap
-import android.graphics.RectF
+import com.google.android.gms.tasks.Tasks
 import java.io.File
 import java.io.FileOutputStream
 import android.graphics.Path
@@ -36,15 +36,15 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.roundToInt
 
 class ScannerService : AccessibilityService() {
- companion object { var instance:ScannerService?=null; private set }
+ companion object { private const val PINCH_FACTOR = 1.42f; var instance:ScannerService?=null; private set }
  private val handler=Handler(Looper.getMainLooper())
  private val executor=Executors.newSingleThreadExecutor()
  private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
- private var ocrFrames=0
  private var moveDelayMs=2500L
- private var scaleMode=0 // 0 manual, 1 assisted (no unsafe unverified zoom)
+ private var scaleMode=1
  private var ignoreKinds=setOf<String>()
  private var scanStart=0L
  private var lastLog=""
@@ -54,23 +54,48 @@ class ScannerService : AccessibilityService() {
  private var verticalNoMotion=0
  private var maxMoveRetries=5
  private var moveRetries=0
- private var restoreRetries=0
- private var baselineSample:IntArray?=null
- private var zoomCenterX=0f
- private var zoomCenterY=0f
- private data class Candidate(val x:Float,val y:Float,val name:String,val level:Int,val kind:Int)
- private var pendingCandidates=mutableListOf<Candidate>()
- private var verificationAttempts=0
- private var lastCandidateAnchorX=0f
- private var lastCandidateAnchorY=0f
- private var allowedKinds=setOf(0,1,2) // 0 blue, 1 red, 2 white
- private var zoomStep=0
- private val maxZoomSteps=3
- private var centered=false
- private var savedCandidate:Candidate?=null
- private var zoomScale=1f
- private var pendingGesture=false
- private var uncertainMoves=0
+ private var allowedKinds=setOf(0,1,2)
+ private val russian by lazy { RussianOcr(this) }
+ private var runId = 0L
+ private var planNavigation = false
+ private data class Swipe(val x1:Float,val y1:Float,val x2:Float,val y2:Float)
+ private var nextSwipe: Swipe? = null
+ private var navigationStop: String? = null
+ private var firstOverview: List<FocusMark>? = null
+ private data class PendingBase(val mark:FocusMark, val retry:Int=0)
+ private val queue = ArrayDeque<PendingBase>()
+ private var undecided = 0
+ private var totalUnresolved = 0
+ private data class Snapshot(val colors:IntArray, val map:VisualRegistration.Frame, val layout:MapLayout,
+                             val measured:Map<VisualRegistration.Frame,MapTransform?>,
+                             var landmarks:List<FocusMark> = emptyList())
+ private data class CameraStep(val pan:FocusPoint?, val pivot:FocusPoint, val sample:Snapshot,
+                               val factor:Float=PINCH_FACTOR)
+ private data class Inspection(
+     val base:PendingBase, val tracker:FocusTracker, val original:Snapshot,
+     val history:MutableList<CameraStep> = mutableListOf(),
+     var waiting:CameraStep? = null, var undoing:Boolean = false, var undoWait:Int = 0,
+     var restore:Boolean = false, var retry:Boolean = false, var zooms:Int = 0, var sentGesture:Boolean = false,
+     var lastName:String? = null, var manualOther:String? = null, var hits:Int = 0, var reads:Int = 0,
+     var predictionFrame:Snapshot? = null, var corrections:Int=0, var panGain:Float=1f,
+     var rechecked:Boolean=false
+ )
+ private var current:Inspection? = null
+ private var originalSize:Pair<Int,Int>? = null
+ private var viewInitialized = false
+ private var settling = false
+ private var settleFrames = 0
+ private var lastSettle: Snapshot? = null
+ private fun resetInspection() {
+     current=null; queue.clear(); nextSwipe=null; viewInitialized=false
+     originalSize=null; undecided=0; totalUnresolved=0; planNavigation=false; settling=false; lastSettle=null
+     navigationStop=null; firstOverview=null
+ }
+ private fun schedule(ms:Long) {
+     val id=runId
+     handler.postDelayed({ if(running && runId==id) scan() },ms)
+ }
+
  private var diagnosticMode=false
  private var diagnosticChecks=0
  private var diagnosticPair=0
@@ -93,19 +118,11 @@ class ScannerService : AccessibilityService() {
  private var target="Doctor8rtx6hjd"
  private var targetLevel=20
  private var searchMode=0
- private var phase=0 // 0 search, 1 zoom verification, 2 restore zoom
- private var candidateX=0f
- private var candidateY=0f
- private var candidateKey=""
- private val rejected=mutableSetOf<String>()
- private var noMotion=0
- private var zoomHits=0
- private var hits=0
- private var step=0
  private var direction=1 // 1: right on map, -1: left on map
  private var edgeCount=0
  private var row=0
- private var previousSample:IntArray?=null
+ private var previousSample:Snapshot?=null
+ private var dispatchedSwipe:Swipe?=null
  private var checkingMovement=false
  private var verticalCheck=false
  private var maxRows=150
@@ -122,218 +139,477 @@ class ScannerService : AccessibilityService() {
  private var width=0
  private var height=0
  var status="Ожидание"; private set
- override fun onServiceConnected() { instance=this; status="Служба готова"; showOverlay() }
+ override fun onServiceConnected() {
+     instance=this
+     val p=getSharedPreferences("scanner",MODE_PRIVATE)
+     val ignored=listOf("resources","mobs","enemies","neutral","allies","castles").filter { p.getBoolean("ignore_$it",false) }.toSet()
+     configure(p.getString("name",target).orEmpty(),p.getInt("level",20),p.getInt("mode",0),
+         p.getLong("delay",2500),p.getInt("retries",5),scale=p.getInt("scale",1),ignored=ignored,
+         diagnostic=p.getBoolean("diagnostic",false))
+     status="Служба готова"; showOverlay()
+ }
  override fun onAccessibilityEvent(event:AccessibilityEvent?) {}
  override fun onInterrupt() { stopScanning() }
- override fun onDestroy() { hideOverlay(); stopScanning(); recognizer.close(); tone?.release(); executor.shutdown(); instance=null; super.onDestroy() }
- fun configure(name:String, level:Int, mode:Int=0, delayMs:Long=2500, retries:Int=5, kinds:Set<Int> = setOf(0,1,2), scale:Int=0, ignored:Set<String> = emptySet(), diagnostic:Boolean=false) { diagnosticMode=diagnostic; scaleMode=scale; ignoreKinds=ignored; target=name.trim(); targetLevel=level; searchMode=mode.coerceIn(0,2); moveDelayMs=delayMs.coerceIn(500,15000); maxMoveRetries=retries.coerceIn(1,12); allowedKinds=kinds; hits=0; rejected.clear(); resetNavigation() }
- fun startScanning() { if(running) return; hits=0; resetNavigation(); scanStart=System.currentTimeMillis(); running=true; busy=false
+ override fun onDestroy() { hideOverlay(); stopScanning(); executor.execute { recognizer.close(); russian.close() }; tone?.release(); executor.shutdown(); instance=null; super.onDestroy() }
+ fun configure(name:String, level:Int, mode:Int=0, delayMs:Long=2500, retries:Int=5, kinds:Set<Int> = setOf(0,1,2), scale:Int=0, ignored:Set<String> = emptySet(), diagnostic:Boolean=false) { if(running) return; diagnosticMode=diagnostic; scaleMode=scale; ignoreKinds=ignored; target=name.trim(); targetLevel=level; searchMode=mode.coerceIn(0,2); moveDelayMs=delayMs.coerceIn(500,15000); maxMoveRetries=retries.coerceIn(1,12); allowedKinds=kinds; resetNavigation() }
+ fun startScanning() { if(running) return; runId++; resetNavigation(); scanStart=System.currentTimeMillis(); running=true; busy=false
   diagnosticDirectory=if(diagnosticMode) File(getExternalFilesDir(null) ?: filesDir,"navigation_${scanStart}").also { it.mkdirs() } else null
-  report(if(diagnosticMode) "Диагностика 3+1; кадры: ${diagnosticDirectory?.absolutePath}" else "Сканирую: ${if(scaleMode==0) "ручной" else "контроль масштаба"}")
-  handler.postDelayed({ scan() },1200) }
- private fun saveDiagnosticFrame(bitmap:Bitmap, suffix:String) {
-  if(!diagnosticMode) return
-  val folder=diagnosticDirectory ?: return
-  try { FileOutputStream(File(folder,"pair_${diagnosticPair}_${suffix}.jpg")).use { bitmap.compress(Bitmap.CompressFormat.JPEG,88,it) } }
-  catch(e:Exception) { report("Не удалось сохранить кадр: ${e.message}") }
+  val mode=listOf("имя и уровень","уровень","имя")[searchMode]
+  report(if(diagnosticMode) "${installedVersion()} · Диагностика 3+1; кадры: ${diagnosticDirectory?.absolutePath}" else "${installedVersion()} · Поиск: $mode · ${if(searchMode!=1) target else ""} ${if(searchMode!=2) "ур. $targetLevel" else ""} · ${if(scaleMode==0) "масштаб фиксирован" else "автоувеличение"}")
+  schedule(1200) }
+ private fun saveDiagnosticFrame(bitmap:Bitmap,folder:File,pair:Int,suffix:String) {
+  FileOutputStream(File(folder,"pair_${pair}_${suffix}.jpg")).use { bitmap.compress(Bitmap.CompressFormat.JPEG,88,it) }
  }
- fun stopScanning() { running=false; busy=false; previousSample=null; pendingDiagnosticBefore?.recycle(); pendingDiagnosticBefore=null; report("Остановлено пользователем") }
+ fun stopScanning() { runId++; running=false; busy=false; previousSample=null; pendingDiagnosticBefore?.recycle(); pendingDiagnosticBefore=null; report("Остановлено пользователем") }
  private fun report(message:String) { status=message; lastLog=message; val time=SimpleDateFormat("HH:mm:ss",Locale.getDefault()).format(Date()); journal.addLast("$time | $message"); while(journal.size>120) journal.removeFirst(); updateOverlay() }
  fun diagnostics():String = journal.joinToString("\n")
- private fun stopWith(reason:String) { running=false; busy=false; previousSample=null; checkingMovement=false; pendingDiagnosticBefore?.recycle(); pendingDiagnosticBefore=null; report(reason); Toast.makeText(this,reason,Toast.LENGTH_LONG).show() }
- private fun resetNavigation() { pendingCandidates.clear(); verificationAttempts=0; savedCandidate=null; zoomStep=0; centered=false; zoomScale=1f; pendingGesture=false; uncertainMoves=0; movementSamples.clear(); baselineSample=null; restoreRetries=0; moveRetries=0; phase=0; noMotion=0; zoomHits=0; step=0; rowSteps=0; verticalNoMotion=0; direction=1; edgeCount=0; row=0; previousSample=null; checkingMovement=false; verticalCheck=false; horizontalStillChecks=0; verticalStillChecks=0; confirmedHorizontalMoves=0; attemptedHorizontalMoves=0; awaitingMotion=false; diagnosticChecks=0; diagnosticPair=0; pendingDiagnosticBefore?.recycle(); pendingDiagnosticBefore=null; diagnosticVerticalDone=false; uncertainHorizontal=0; uncertainVertical=0; verticalTransitionPending=false; edgeProbeStage=0; recoveryCycles=0; recoveryGestureCount=0; edgeEvidence=0; probeReverseChanged=false }
+ private fun stopWith(reason:String) {
+     if(planNavigation) { navigationStop=reason; return }
+     runId++; running=false; busy=false; previousSample=null; checkingMovement=false
+     pendingDiagnosticBefore?.recycle(); pendingDiagnosticBefore=null
+     report(reason); Toast.makeText(this,reason,Toast.LENGTH_LONG).show()
+ }
+ private fun resetNavigation() { resetInspection(); movementSamples.clear(); moveRetries=0; rowSteps=0; verticalNoMotion=0; direction=1; edgeCount=0; row=0; previousSample=null; checkingMovement=false; verticalCheck=false; horizontalStillChecks=0; verticalStillChecks=0; confirmedHorizontalMoves=0; attemptedHorizontalMoves=0; awaitingMotion=false; diagnosticChecks=0; diagnosticPair=0; pendingDiagnosticBefore?.recycle(); pendingDiagnosticBefore=null; diagnosticVerticalDone=false; uncertainHorizontal=0; uncertainVertical=0; verticalTransitionPending=false; edgeProbeStage=0; recoveryCycles=0; recoveryGestureCount=0; edgeEvidence=0; probeReverseChanged=false }
  private fun scan() {
-  if(!running || busy) return
-  busy=true
-  takeScreenshot(Display.DEFAULT_DISPLAY,executor,object:TakeScreenshotCallback {
-   override fun onSuccess(result:ScreenshotResult) {
-    val buffer:HardwareBuffer=result.hardwareBuffer
-    try {
-     val hardware=Bitmap.wrapHardwareBuffer(buffer,result.colorSpace)
-     val bitmap=hardware?.copy(Bitmap.Config.ARGB_8888,false)
-     hardware?.recycle()
-     if(bitmap==null) { handler.post { fail("Ошибка изображения") }; return }
-     width=bitmap.width; height=bitmap.height
-     val sample=sampleMap(bitmap)
-     if(diagnosticMode && phase==0) {
-      // Save the full image at the time of the gesture, not an interpolated sparse sample.
-      if(checkingMovement) saveDiagnosticFrame(bitmap,"after")
-      else { diagnosticPair++; saveDiagnosticFrame(bitmap,"before") }
-      handler.post {
-       bitmap.recycle(); busy=false
-       if(running) navigate(sample)
-      }
-      return
+     if (!running || busy) return
+     busy=true
+     val id=runId
+     val fullRussian = searchMode==2 && TargetReading.russian(target)
+     val diag = diagnosticMode
+     val diagAfter = checkingMovement
+     val pair=diagnosticChecks+1
+     val directory=diagnosticDirectory
+     val overlayMask=overlayBounds()?.let { MapText("",it.left,it.top,it.right,it.bottom) }
+     val references=mutableMapOf<VisualRegistration.Frame,Boolean>()
+     if(!settling || lastSettle!=null) {
+         lastSettle?.let { references[it.map]=false }
+         val task=current
+         task?.waiting?.let { references[it.sample.map]=it.pan==null }
+         task?.predictionFrame?.let { references[it.map]=false }
+         if(task!=null && task.restore) {
+             references[task.original.map]=true
+             task.history.lastOrNull()?.let { references[it.sample.map]=true }
+         }
+         if(checkingMovement && (diag || (!viewInitialized && firstOverview!=null))) {
+             previousSample?.let { references[it.map]=false }
+         }
      }
-     // Enlarging the map improves small Latin labels and level digits. Keep
-     // bounding boxes in original screen coordinates for gesture positioning.
-     ocrFrames++
-     val ocrFactor=if(bitmap.width<1200) 2 else 1
-     val ocrBitmap=if(ocrFactor==1) bitmap else Bitmap.createScaledBitmap(bitmap,bitmap.width*ocrFactor,bitmap.height*ocrFactor,true)
-     recognizer.process(InputImage.fromBitmap(ocrBitmap,0))
-      .addOnSuccessListener { text ->
-       val blocks=text.textBlocks.flatMap { it.lines }.mapNotNull { line ->
-        line.boundingBox?.let { b -> Pair(line.text,Rect(b.left/ocrFactor,b.top/ocrFactor,b.right/ocrFactor,b.bottom/ocrFactor)) }
-       }
-       handler.post {
-        if(ocrBitmap!==bitmap) ocrBitmap.recycle()
-        bitmap.recycle(); busy=false
-        if(!running) return@post
-        when(phase) {
-         0 -> {
-          if(pendingCandidates.isEmpty()) {
-           pendingCandidates.addAll(findCandidates(blocks).take(24))
-           if(pendingCandidates.isNotEmpty()) report("Кандидатов на текущем экране: ${pendingCandidates.size}")
-          }
-          if(pendingCandidates.isNotEmpty()) {
-           val candidate=pendingCandidates.removeAt(0)
-           candidateX=candidate.x; candidateY=candidate.y; savedCandidate=candidate
-           lastCandidateAnchorX=candidate.x; lastCandidateAnchorY=candidate.y
-           candidateKey="${row}:${direction}:${step}:${(candidateX/55).toInt()}:${(candidateY/55).toInt()}"
-           if(searchMode==1 && candidate.level==targetLevel) found()
-           else if(searchMode==2 && namesMatch(candidate.name,target) && candidate.level==targetLevel) found()
-           else if(searchMode==0 && namesMatch(candidate.name,target) && candidate.level==targetLevel) found()
-           else if(searchMode==2) { rejected.add(candidateKey); handler.postDelayed({scan()},250) }
-           else {
-            baselineSample=sample.copyOf(); restoreRetries=0; zoomStep=0; centered=true; verificationAttempts=0
-            // Any zoom invalidates other candidates' screen coordinates. Re-detect on return.
-            pendingCandidates.clear()
-            phase=1; zoomHits=0; status="Проверяю кандидата без перемещения карты"
-            performPinch(candidateX,candidateY,true)
-           }
-          } else navigate(sample)
+     takeScreenshot(Display.DEFAULT_DISPLAY, executor, object:TakeScreenshotCallback {
+         override fun onFailure(errorCode:Int) = postFailure(id, "Снимок недоступен: $errorCode")
+         override fun onSuccess(result:ScreenshotResult) {
+             val frame = try {
+                 val hw = checkNotNull(Bitmap.wrapHardwareBuffer(result.hardwareBuffer,result.colorSpace))
+                 try { checkNotNull(hw.copy(Bitmap.Config.ARGB_8888,false)) } finally { hw.recycle() }
+             } catch(e:Exception) { postFailure(id, "Снимок: ${e.message}"); return }
+             finally { result.hardwareBuffer.close() }
+             try {
+                 val layout=MapLayout.detect(frame.width,frame.height,frame::getPixel)
+                 val texture=captureMap(frame,overlayMask,layout)
+                 val measured=references.mapValues { (before,zoom)->VisualRegistration.estimate(before,texture,zoom) }
+                 val sample=Snapshot(sampleMap(frame),texture,layout,measured)
+                 if(diag) {
+                     if(directory!=null) {
+                         saveDiagnosticFrame(frame,directory,pair,if(diagAfter) "after" else "before")
+                         if(diagAfter && pair<4) saveDiagnosticFrame(frame,directory,pair+1,"before")
+                     }
+                     val w=frame.width; val h=frame.height; frame.recycle()
+                     handler.post { if(running && id==runId) {
+                         width=w; height=h; busy=false; navigate(sample)
+                     } }
+                     return
+                 }
+                 val full=readLatin(frame).toMutableList()
+                 if(fullRussian) full.addAll(readRussian(frame,null))
+                 val lines=LevelBadges.merge(full,readLevelBadges(frame,layout) { atlas -> readLatin(atlas) })
+                 handler.post {
+                     if(!running || id!=runId) { frame.recycle(); return@post }
+                     busy=false
+                     if(originalSize!=null && originalSize != (frame.width to frame.height)) {
+                         frame.recycle(); stopWith("Размер экрана изменился. Проверьте обзор."); return@post
+                     }
+                     width=frame.width; height=frame.height; originalSize=width to height
+                     // inspectFrame returns true only when the OCR worker takes ownership of the bitmap.
+                     var handedOff=false
+                     try { handedOff=inspectFrame(frame,sample,lines,id) }
+                     finally { if(!handedOff) frame.recycle() }
+                 }
+             } catch(e:Exception) { frame.recycle(); postFailure(id,"OCR: ${e.message}") }
+               catch(e:LinkageError) { frame.recycle(); postFailure(id,"Русский OCR: ${e.message}") }
          }
-         1 -> {
-          verificationAttempts++
-          // Keep the zoom anchor fixed; never chase OCR boxes across a busy map.
-          val matched=hasNameNear(blocks,lastCandidateAnchorX,lastCandidateAnchorY) &&
-           hasExpectedLevelNear(blocks,lastCandidateAnchorX,lastCandidateAnchorY)
-          if(matched) {
-           zoomHits++
-           if(zoomHits>=2) found() else handler.postDelayed({scan()},500)
-          } else if(zoomStep<maxZoomSteps && verificationAttempts<maxZoomSteps+3) {
-           zoomHits=0
-           performPinch(lastCandidateAnchorX,lastCandidateAnchorY,true)
-          } else {
-           rejected.add(candidateKey); phase=2; status="Кандидат не подтверждён; возвращаю обзор"
-           if(zoomStep>0) performPinch(lastCandidateAnchorX,lastCandidateAnchorY,false)
-           else handler.postDelayed({scan()},250)
-          }
+     })
+ }
+ private fun postFailure(id:Long, reason:String) { handler.post { if(running && runId==id) fail(reason) } }
+ private fun captureMap(frame:Bitmap,overlayMask:MapText?,layout:MapLayout):VisualRegistration.Frame {
+     val (nx,ny)=VisualRegistration.gridSize(frame.width,frame.height)
+     val small=Bitmap.createScaledBitmap(frame,nx,ny,true)
+     val pixels=IntArray(nx*ny)
+     try { small.getPixels(pixels,0,nx,0,0,nx,ny) } finally { if(small!==frame) small.recycle() }
+     return VisualRegistration.capture(frame.width,frame.height,overlayMask,layout) { x,y ->
+         val ix=((x+.5f)*nx/frame.width).toInt().coerceIn(0,nx-1)
+         val iy=((y+.5f)*ny/frame.height).toInt().coerceIn(0,ny-1)
+         val c=pixels[iy*nx+ix]
+         (((c shr 16 and 255)*77 + (c shr 8 and 255)*150 + (c and 255)*29) shr 8)
+     }
+ }
+ private fun readLatin(frame:Bitmap, area:Rect?=null):List<MapText> {
+     val crop=if(area==null) frame else Bitmap.createBitmap(frame,area.left,area.top,area.width(),area.height())
+     val factor=if(area!=null) 3 else if(frame.width<1200) 2 else 1
+     val image=if(factor==1) crop else Bitmap.createScaledBitmap(crop,crop.width*factor,crop.height*factor,true)
+     val x=area?.left ?: 0; val y=area?.top ?: 0
+     fun text(s:String,b:Rect,confidence:Float)=MapText(s,x+b.left/factor,y+b.top/factor,x+(b.right+factor-1)/factor,
+         y+(b.bottom+factor-1)/factor,confidence.takeIf { it>0f && it<=1f }?.times(100f))
+     try {
+         val result=Tasks.await(recognizer.process(InputImage.fromBitmap(image,0)))
+         return buildList {
+             for(block in result.textBlocks) for(line in block.lines) {
+                 val whole=line.boundingBox?.let { text(line.text,it,line.confidence) }
+                 if(whole!=null) add(whole)
+                 if(whole==null || TargetReading.level(whole)==null) {
+                     for(el in line.elements) el.boundingBox?.let {
+                         val item=text(el.text,it,el.confidence)
+                         if(TargetReading.level(item)!=null) add(item)
+                     }
+                 }
+             }
          }
-         else -> {
-          if(zoomStep>0) {
-           status="Возврат масштаба: осталось $zoomStep"
-           performPinch(lastCandidateAnchorX,lastCandidateAnchorY,false)
-          } else {
-           pendingCandidates.clear()
-           phase=0; baselineSample=null; previousSample=null; checkingMovement=false
-           // The original camera offset may differ after pinch; stop rather than silently drift.
-           status="Обзор восстановлен; повторное обнаружение объектов"
-           handler.postDelayed({scan()},moveDelayMs)
-          }
+     } finally { if(image!==crop) image.recycle(); if(crop!==frame) crop.recycle() }
+ }
+ private fun readRussian(frame:Bitmap,area:Rect?)=russian.read(frame,area)
+ private fun badgeMark(t:MapText)=FocusMark(TargetReading.level(t).toString(),t.x,t.y)
+ private fun nameMark(t:MapText)=FocusMark("@name",t.x,t.y)
+ private fun overlayBounds():Rect? {
+     val view=overlay ?: return null
+     if(!view.isShown) return null
+     val xy=IntArray(2); view.getLocationOnScreen(xy)
+     return Rect(xy[0],xy[1],xy[0]+view.width,xy[1]+view.height)
+ }
+ private fun sameSpot(mark:FocusMark, marks:List<FocusMark>, tolerance:Float):FocusMark? =
+     marks.singleOrNull { it.label==mark.label && hypot(it.x-mark.x,it.y-mark.y)<tolerance }
+ private fun inspectFrame(frame:Bitmap,sample:Snapshot,lines:List<MapText>,id:Long):Boolean {
+     if(settling) {
+         val previous=lastSettle
+         val motion=previous?.let { sample.measured[it.map] }
+         val stable=previous!=null && (motion?.let { cameraAligned(it,width,height) }
+             ?: (difference(previous.colors,sample.colors)<=.025))
+         if(!stable) {
+             lastSettle=sample
+             if(++settleFrames>=4) stopWith("Карта продолжает двигаться. Положение цели не подтверждено.")
+             else schedule(550)
+             return false
          }
-        }
-       }
-      }.addOnFailureListener { e -> if(ocrBitmap!==bitmap) ocrBitmap.recycle(); bitmap.recycle(); handler.post { fail("OCR: ${e.message}") } }
-    } catch(e:Exception) { handler.post { fail("Скриншот: ${e.message}") } }
-    finally { buffer.close() }
-   }
-   override fun onFailure(errorCode:Int) { handler.post { fail("Снимок недоступен: $errorCode") } }
-  })
+         settling=false; lastSettle=null
+     }
+     val overlayBox=overlayBounds()
+     val overview=sample.layout==MapLayout.OVERVIEW
+     val minY=height*(if(overview) .03f else .09f)
+     val maxY=height*(if(overview) .985f else .92f)
+     val mask=overlayBox?.let { MapText("",it.left,it.top,it.right,it.bottom) }
+     val scene=FocusTracker(width,height,FocusMark("",0f,0f),emptyList(),mask,layout=sample.layout)
+     val visible=lines.filter { t-> t.right>t.left && t.bottom>t.top &&
+         t.y in minY..maxY && t.x in width*.015f..width*.985f &&
+         (!overview || scene.readableBox(t.x.toInt()-1,t.y.toInt()-1,t.x.toInt()+1,t.y.toInt()+1)) &&
+         (overlayBox==null || !Rect.intersects(overlayBox,Rect(t.left,t.top,t.right,t.bottom))) }
+     val badges=mutableListOf<MapText>()
+     val nicks=mutableListOf<MapText>()
+     for(t in visible) {
+         val level=TargetReading.level(t)
+         val group=when { level!=null -> badges; TargetReading.matches(t.text,target) -> nicks; else->continue }
+         if(group.none { abs(it.x-t.x)<maxOf(3f,minOf(it.h,t.h)*.45f) && abs(it.y-t.y)<maxOf(3f,minOf(it.h,t.h)*.45f) }) group.add(t)
+     }
+     val marks=badges.map(::badgeMark) + if(searchMode==2) nicks.map(::nameMark) else emptyList()
+     sample.landmarks=badges.filter { scene.readableBox(it.left,it.top,it.right,it.bottom) }.map(::badgeMark)
+     if(!viewInitialized) {
+         val candidates=if(searchMode==2) nicks.map(::nameMark) + badges.map(::badgeMark)
+                        else badges.filter { TargetReading.level(it)==targetLevel }.map(::badgeMark)
+         val first=firstOverview
+         if(first==null) {
+             firstOverview=candidates; schedule(550); return false
+         }
+         firstOverview=null
+         planNavigation=true
+         try { navigate(sample) } finally { planNavigation=false }
+         if(allowedKinds.isNotEmpty() && ignoreKinds.size<6)
+             mergeOverviewCandidates(first,candidates,width*.012f).forEach { queue.addLast(PendingBase(it)) }
+         viewInitialized=true
+     }
+     if(current==null) {
+         while(queue.isNotEmpty() && current==null) {
+             val base=queue.removeFirst()
+             val anchor=sameSpot(base.mark,marks,width*.018f)
+             if(anchor==null) {
+                 if(base.retry==0) {
+                     queue.addLast(base.copy(retry=1)); schedule(550); return false
+                 }
+                 undecided++; continue
+             }
+             current=Inspection(base,FocusTracker(width,height,anchor,marks,mask,layout=sample.layout),sample)
+             report("Кандидат ${anchor.label} · (${anchor.x.toInt()}, ${anchor.y.toInt()}) · осталось ${queue.size}")
+         }
+         if(current==null) {
+             if(undecided>0) {
+                 totalUnresolved+=undecided
+                 report("На участке осталось неподтверждённых: $undecided · всего за проход: $totalUnresolved")
+             }
+             navigationStop?.let { stopWith(it); return false }
+             val swipe=nextSwipe
+             if(swipe==null) { stopWith("Для полосы не задан следующий жест"); return false }
+             nextSwipe=null; viewInitialized=false; previousSample=sample; undecided=0
+             performSwipe(swipe.x1,swipe.y1,swipe.x2,swipe.y2); return false
+         }
+     }
+     val task=checkNotNull(current)
+     task.tracker.layout=sample.layout; task.tracker.overlay=mask
+     if(task.restore) { restoreFrame(task,marks,sample); return false }
+     val pending=task.waiting
+     if(pending!=null) {
+         task.waiting=null
+         val visual=sample.measured[pending.sample.map]
+         val ok=if(pending.pan!=null) task.tracker.afterPan(marks,pending.pan,visual)
+                else task.tracker.afterZoom(marks,pending.pivot,pending.factor,visual)
+         if(visual!=null) {
+             val moved=visual.map(pending.pivot)
+             val dx=moved.x-pending.pivot.x; val dy=moved.y-pending.pivot.y
+             report("Карта: ×${"%.2f".format(Locale.US,visual.scale)}, сдвиг (${dx.toInt()}, ${dy.toInt()}) · значков ${badges.size}")
+             val pan=pending.pan
+             if(ok && pan!=null) task.panGain=((dx*pan.x+dy*pan.y)/(pan.x*pan.x+pan.y*pan.y)).coerceIn(.35f,3f)
+         }
+         if(!ok) {
+             if(!task.rechecked && (visual==null || !cameraAligned(visual,width,height))) {
+                 task.rechecked=true; task.tracker.retryUnmatchedFrame(); task.waiting=pending
+                 report("Повторный снимок после жеста · значков ${badges.size}")
+                 schedule(550); return false
+             }
+             if(sameCamera(pending.sample,sample,visual)) task.history.removeAt(task.history.lastIndex)
+             beginReturn(task,true,"Цель не сопоставлена после жеста · значков ${badges.size}, карта ${if(visual==null) "не измерена" else "измерена"}")
+             restoreFrame(task,marks,sample); return false
+         }
+         if(task.tracker.predicted) task.predictionFrame=sample
+     }
+     val point=task.tracker.point
+     val observed=sameSpot(FocusMark(task.base.mark.label,point.x,point.y),marks,width*.023f)
+     if(task.tracker.predicted) {
+         val reference=task.predictionFrame
+         val stationary=reference===sample || (reference!=null && sample.measured[reference.map]?.let { cameraAligned(it,width,height) }==true)
+         if(searchMode==1 || !stationary || ++task.reads>4) {
+             beginReturn(task,true,"Значок после увеличения не подтверждён")
+             restoreFrame(task,marks,sample); return false
+         }
+         return readFocus(frame,task,id) { roi ->
+             val blocked=overlayBounds()
+             val visibleRoi=roi.filter { blocked==null || !Rect.intersects(blocked,Rect(it.left,it.top,it.right,it.bottom)) }
+             val match=task.tracker.predictedName(visibleRoi,target,badges)
+             if(match!=null) noteMatch(task)
+             else { task.hits=0; task.lastName=null; schedule(550) }
+         }
+     }
+     if(observed==null) {
+         beginReturn(task,true,"Значок пропал или совпал с соседом")
+         restoreFrame(task,marks,sample); return false
+     }
+     val badge=badges.firstOrNull { badgeMark(it)==observed }
+     val label=nicks.firstOrNull { nameMark(it)==observed }
+     fun safe(t:MapText)=task.tracker.readableBox(t.left,t.top,t.right,t.bottom)
+     fun namedBase(lines:List<MapText>)=badge!=null && lines.any {
+         safe(it) && TargetReading.isBaseCaption(badge,it,badges,width,height)
+     }
+     // Retain the direct-match path for a fully readable base before moving the camera.
+     val direct=when(searchMode) {
+         1 -> badge!=null && safe(badge) && (BaseMarker.hasOverviewPin(badge,width,height,frame::getPixel) ||
+                  (!overview && namedBase(visible)))
+         2 -> label!=null && safe(label) || badge!=null && safe(badge) &&
+             nicks.any { safe(it) && TargetReading.ownsName(badge,it,badges,width,height) }
+         else -> badge!=null && safe(badge) && nicks.any { safe(it) && TargetReading.ownsName(badge,it,badges,width,height) }
+     }
+     if(++task.reads>8) {
+         beginReturn(task,true,"Чтение не стабилизировалось"); restoreFrame(task,marks,sample); return false
+     }
+     if(direct) { noteMatch(task); return false }
+     if(badge!=null && safe(badge) && searchMode!=1) {
+         return readFocus(frame,task,id) { roi ->
+             decideReading(task,badge,badges,roi,sample,marks,overlayBounds())
+         }
+     }
+     if(!task.tracker.inReadingArea() || (badge!=null && !safe(badge))) {
+         task.hits=0; task.lastName=null
+         val delta=task.tracker.nextPan(forceCenter=badge!=null && !safe(badge))
+         if(delta==null) { beginReturn(task,true,"Не удалось вывести подпись из-под интерфейса"); restoreFrame(task,marks,sample) }
+         else issueFocusStep(task,CameraStep(delta,point,sample))
+         return false
+     }
+     if(searchMode==1) {
+         return readFocus(frame,task,id) { roi ->
+             if(!overview && namedBase(roi)) noteMatch(task)
+             else {
+                 task.hits=0; task.lastName=null
+                 when {
+                     task.reads<2 -> schedule(550)
+                     scaleMode!=0 && task.zooms==0 -> {
+                         task.zooms++
+                         issueFocusStep(task,CameraStep(null,point,sample,if(task.base.retry==0) PINCH_FACTOR else 1.24f))
+                     }
+                     else -> { beginReturn(task,true,"Уровень есть, тип объекта не подтверждён"); restoreFrame(task,marks,sample) }
+                 }
+             }
+         }
+     }
+     decideReading(task,badge,badges,visible,sample,marks,overlayBox)
+     return false
  }
- private fun norm(s:String)=s.lowercase(Locale.ROOT).filter { it.isLetterOrDigit() }
- private fun namesMatch(actual:String,expected:String):Boolean {
-  val a=norm(actual); val b=norm(expected)
-  if(b.isEmpty() || a.isEmpty()) return false
-  return a.contains(b) || (b.length>=5 && a.length>=4 && b.contains(a) && a.length>=b.length-2)
+ private fun readFocus(frame:Bitmap,task:Inspection,id:Long,completed:(List<MapText>)->Unit):Boolean {
+     val point=task.tracker.point
+     val area=Rect((point.x-width*.25f).toInt(),(point.y-height*.08f).toInt(),
+                   (point.x+width*.25f).toInt(),(point.y+height*.06f).toInt())
+     check(area.intersect(0,0,frame.width,frame.height))
+     busy=true
+     executor.execute {
+         try {
+             val lines=if(TargetReading.russian(target)) readRussian(frame,area) else readLatin(frame,area)
+             val complete=lines.filter { it.left>area.left+1 && it.top>area.top+1 &&
+                                         it.right<area.right-1 && it.bottom<area.bottom-1 }
+             handler.post { if(running && id==runId && current===task) { busy=false; completed(complete) } }
+         } catch(e:Exception) { postFailure(id,"OCR подписи: ${e.message}") }
+           catch(e:LinkageError) { postFailure(id,"OCR подписи: ${e.message}") }
+         finally { frame.recycle() }
+     }
+     return true
  }
- private fun findCandidates(lines:List<Pair<String,Rect>>):List<Candidate> {
-  val result=mutableListOf<Candidate>()
-  val levels=lines.filter { (t,r) ->
-   t.trim().matches(Regex("[0-9]{1,2}")) && r.centerY()>height*.12 && r.centerY()<height*.86
-  }
-  for((levelText,lr) in levels) {
-   val level=levelText.trim().toIntOrNull() ?: continue
-   if(level!=targetLevel) continue
-   // Game layouts vary with zoom: labels can be above, below or beside a badge.
-   val names=lines.filter { (t,r) ->
-    t.any { it.isLetter() } && r!=lr &&
-    abs(r.centerX()-lr.centerX())<width*.22 &&
-    abs(r.centerY()-lr.centerY())<height*.12 &&
-    !t.contains("Крепость",true) && !t.contains("Точка сбора",true)
-   }
-   val named=names.minByOrNull { abs(it.second.centerX()-lr.centerX())+abs(it.second.centerY()-lr.centerY()) }
-   val name=named?.first ?: ""
-   val cx=lr.centerX().toFloat(); val cy=lr.centerY().toFloat()
-   if(cx<width*.10f || cx>width*.90f || cy<height*.13f || cy>height*.86f) continue
-   if(allowedKinds.isEmpty() || ignoreKinds.size>=6) continue
-   val key="${row}:${direction}:${step}:${(cx/55).toInt()}:${(cy/55).toInt()}"
-   if(key in rejected) continue
-   // An unreadable name is a verification candidate, not a negative match.
-   result.add(Candidate(cx,cy,name,level,-1))
-  }
-  return result.distinctBy { Pair((it.x/55).toInt(),(it.y/55).toInt()) }
-   .sortedWith(compareBy<Candidate> { it.y }.thenBy { it.x })
+ private fun noteMatch(task:Inspection) {
+     if(task.lastName!=target) task.hits=0
+     task.lastName=target
+     if(++task.hits>=2) found() else schedule(550)
  }
- private fun hasExpectedLevelNear(lines:List<Pair<String,Rect>>,x:Float,y:Float):Boolean {
-  val levels=lines.filter { (t,r) ->
-   t.trim().matches(Regex("[0-9]{1,2}")) &&
-   abs(r.centerX()-x)<width*.30 && abs(r.centerY()-y)<height*.24
-  }
-  // If the badge is unreadable after zoom, require a name match on two frames;
-  // never accept a clearly conflicting nearby badge as confirmation.
-  return levels.isEmpty() || levels.any { it.first.trim().toIntOrNull()==targetLevel }
+ private fun decideReading(task:Inspection,badge:MapText?,badges:List<MapText>,lines:List<MapText>,
+                           sample:Snapshot,marks:List<FocusMark>,overlayBox:Rect?) {
+     val nearby=lines.filter { t-> badge!=null && t.text.any(Char::isLetter) && TargetReading.level(t)==null &&
+         TargetReading.ownsName(badge,t,badges,width,height) }
+     val labels=nearby.filter { t->task.tracker.readableBox(t.left,t.top,t.right,t.bottom) &&
+         (overlayBox==null || !Rect.intersects(overlayBox,Rect(t.left,t.top,t.right,t.bottom))) }
+     if(labels.any { TargetReading.matches(it.text,target) }) { noteMatch(task); return }
+     if(nearby.size!=labels.size || !task.tracker.inReadingArea()) {
+         val delta=task.tracker.nextPan(forceCenter=nearby.size!=labels.size)
+         if(delta!=null) issueFocusStep(task,CameraStep(delta,task.tracker.point,sample))
+         else { beginReturn(task,true,"Подпись перекрыта интерфейсом"); restoreFrame(task,marks,sample) }
+         return
+     }
+     val other=labels.singleOrNull()?.takeIf(TargetReading::reliableOther)?.text
+     if(task.zooms>0 && other!=null && task.lastName==other) {
+         beginReturn(task,false,"Прочитан другой ник"); restoreFrame(task,marks,sample); return
+     }
+     task.hits=0; task.lastName=other
+     if(task.zooms>0 && other!=null) { schedule(550); return }
+     if(scaleMode==0) {
+         if(other!=null && task.reads>=2 && task.manualOther==other) {
+             beginReturn(task,false,"На текущем масштабе подтверждён другой ник")
+         } else if(task.reads<3) {
+             task.manualOther=other; schedule(550); return
+         } else {
+             beginReturn(task,true,"Имя не подтверждено при ручном масштабе")
+         }
+         restoreFrame(task,marks,sample); return
+     }
+     if(task.zooms>=3) { beginReturn(task,true,"Подпись осталась нечитаемой"); restoreFrame(task,marks,sample); return }
+     task.zooms++
+     val factor=if(task.base.retry>0) 1.24f else PINCH_FACTOR
+     issueFocusStep(task,CameraStep(null,task.tracker.point,sample,factor))
  }
- private fun locateCandidate(lines:List<Pair<String,Rect>>,candidate:Candidate?):Candidate? {
-  if(candidate==null) return null
-  val wanted=norm(candidate.name)
-  val matches=lines.filter { (t,r) -> wanted.isNotEmpty() && (namesMatch(t,candidate.name)) && r.centerY()>height*.12 && r.centerY()<height*.85 }
-  val nearest=matches.minByOrNull { hypot((it.second.centerX()-candidateX).toDouble(),(it.second.centerY()-candidateY).toDouble()) } ?: return null
-  return candidate.copy(x=nearest.second.centerX().toFloat(),y=nearest.second.centerY().toFloat())
+ private fun issueFocusStep(task:Inspection,step:CameraStep) {
+     task.hits=0; task.lastName=null; task.manualOther=null; task.reads=0; task.rechecked=false
+     task.waiting=step; task.history.add(step); task.sentGesture=true
+     sendCameraStep(step,false)
  }
- private fun hasNameNear(lines:List<Pair<String,Rect>>,x:Float,y:Float):Boolean {
-  val wanted=norm(target)
-  if(wanted.isEmpty()) return false
-  return lines.any { (t,r) -> namesMatch(t,target) && abs(r.centerX()-x)<width*.30 && abs(r.centerY()-y)<height*.28 }
+ private fun beginReturn(task:Inspection,retry:Boolean,why:String) {
+     task.retry=retry; task.restore=true; task.undoWait=0
+     report("$why · возврат к обзору")
  }
- private fun centerTarget(x:Float,y:Float) {
-  val dx=(width*.5f-x).coerceIn(-width*.22f,width*.22f)
-  val dy=(height*.51f-y).coerceIn(-height*.18f,height*.18f)
-  if(abs(dx)<width*.035f && abs(dy)<height*.035f) { centered=true; performPinch(width*.5f,height*.51f,true); return }
-  status="Центрирование (${dx.toInt()}, ${dy.toInt()})"
-  performAbsoluteSwipe(width*.5f,height*.51f,dx,dy,350)
+ private fun sameCamera(before:Snapshot,after:Snapshot,visual:MapTransform?):Boolean {
+     if(before.layout!=after.layout) return false
+     if(visual!=null) return cameraAligned(visual,width,height)
+     return difference(before.colors,after.colors)<=.055 &&
+         matchingLandmarks(before.landmarks,after.landmarks,width,height)
  }
- private fun performAbsoluteSwipe(cx:Float,cy:Float,dx:Float,dy:Float,duration:Long) {
-  val path=Path().apply {moveTo(cx,cy); lineTo(cx+dx,cy+dy)}
-  val gesture=GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path,0,duration)).build()
-  if(!dispatchGesture(gesture,object:GestureResultCallback(){
-   override fun onCompleted(gestureDescription:GestureDescription?) { handler.postDelayed({scan()},moveDelayMs) }
-   override fun onCancelled(gestureDescription:GestureDescription?) { fail("Центрирование прервано") }
-  },handler)) fail("Жест центрирования отклонён")
+ private fun restoreFrame(task:Inspection,marks:List<FocusMark>,sample:Snapshot) {
+     // Undo one command at a time; never chain inverses from an unverified intermediate view.
+     if(task.undoing) {
+         val before=task.history.last().sample
+         val visual=sample.measured[before.map]
+         val aligned=sameCamera(before,sample,visual)
+         if(!aligned) {
+             if(visual!=null && correctReturn(task,sample,visual)) return
+             if(++task.undoWait<=2) schedule(550) else stopWith("Обзор после обратного жеста не подтверждён. Проверьте карту.")
+             return
+         }
+         task.history.removeAt(task.history.lastIndex); task.undoing=false; task.undoWait=0
+     }
+     if(task.history.isNotEmpty()) {
+         task.undoing=true; sendCameraStep(task.history.last(),true); return
+     }
+     val returned=sample.measured[task.original.map]
+     val sameOverview=if(task.sentGesture) task.tracker.restored(marks,returned) &&
+         (returned!=null || difference(task.original.colors,sample.colors)<=.045)
+         else difference(task.original.colors,sample.colors)<=.045
+     if(!sameOverview) {
+         if(returned!=null && correctReturn(task,sample,returned)) return
+         if(++task.undoWait<=2) schedule(550) else stopWith("Исходные ориентиры не совпали. Проверьте обзор.")
+         return
+     }
+     if(task.retry) {
+         if(task.base.retry==0) queue.addLast(task.base.copy(retry=1))
+         else undecided++
+     }
+     if(returned!=null) {
+         repeat(queue.size) {
+             val base=queue.removeFirst()
+             val p=returned.map(FocusPoint(base.mark.x,base.mark.y))
+             queue.addLast(base.copy(mark=base.mark.copy(x=p.x,y=p.y)))
+         }
+     }
+     current=null; schedule(550)
  }
+ private fun correctReturn(task:Inspection,sample:Snapshot,measured:MapTransform):Boolean {
+     if(task.corrections>=2) return false
+     val center=task.tracker.readingCenter ?: return false
+     val adjustment=returnAdjustment(measured,center,width,height,task.panGain) ?: return false
+     if(scaleMode==0 && adjustment.pan==null) return false
+     task.corrections++; task.undoWait=0
+     report("Доводка к исходному обзору · ${task.corrections}/2")
+     sendCameraStep(CameraStep(adjustment.pan,center,sample,adjustment.factor),false)
+     return true
+ }
+ private fun sendCameraStep(step:CameraStep,inverse:Boolean) {
+     val paths=if(step.pan!=null) {
+         val sign=if(inverse) -1 else 1
+         val dx=step.pan.x*sign; val dy=step.pan.y*sign
+         val center=current?.tracker?.readingCenter ?: return stopWith("Центр наведения перекрыт")
+         val cx=center.x; val cy=center.y
+         report("Центрирование · сдвиг (${dx.toInt()}, ${dy.toInt()})")
+         listOf(Path().apply { moveTo(cx-dx/2,cy-dy/2); lineTo(cx+dx/2,cy+dy/2) })
+     } else {
+         val small=width*.105f; val large=small*step.factor
+         report(if(inverse) "Возвращаю масштаб" else if(step.factor>1f) "Увеличиваю на один шаг" else "Уменьшаю на один шаг")
+         listOf(-1,1).map { sign->Path().apply {
+             moveTo(step.pivot.x+sign*(if(inverse) large else small),step.pivot.y)
+             lineTo(step.pivot.x+sign*(if(inverse) small else large),step.pivot.y)
+         } }
+     }
+     val builder=GestureDescription.Builder()
+     paths.forEach { builder.addStroke(GestureDescription.StrokeDescription(it,0,400)) }
+     val id=runId
+     if(!dispatchGesture(builder.build(),object:GestureResultCallback() {
+         override fun onCompleted(g:GestureDescription?) {
+             if(running && runId==id) {
+                 settling=true; settleFrames=0; lastSettle=null
+                 schedule(moveDelayMs)
+             }
+         }
+         override fun onCancelled(g:GestureDescription?) { if(running && runId==id) fail("Жест наведения прерван") }
+     },handler)) fail("Жест наведения отклонён")
+ }
+
  private fun found() {
-  running=false; phase=0; report("Цель найдена: ${if(searchMode==1) "уровень $targetLevel" else target}")
+  running=false; runId++; report("Цель найдена: ${if(searchMode==1) "уровень $targetLevel" else target}")
   notifyFound()
   Toast.makeText(this,status,Toast.LENGTH_LONG).show()
   // Do not tap automatically: the user can inspect the result and tap manually.
- }
- private fun performPinch(cx:Float,cy:Float,zoomIn:Boolean) {
-  val from=width*(if(zoomIn) .105f else .155f)
-  val to=width*(if(zoomIn) .155f else .105f)
-  val x=cx.coerceIn(width*.25f,width*.75f)
-  val y=cy.coerceIn(height*.25f,height*.70f)
-  val p1=Path().apply { moveTo(x-from,y); lineTo(x-to,y) }
-  val p2=Path().apply { moveTo(x+from,y); lineTo(x+to,y) }
-  val gesture=GestureDescription.Builder()
-   .addStroke(GestureDescription.StrokeDescription(p1,0,450))
-   .addStroke(GestureDescription.StrokeDescription(p2,0,450)).build()
-  if(!dispatchGesture(gesture,object:GestureResultCallback() {
-   override fun onCompleted(gestureDescription:GestureDescription?) {
-    if(zoomIn) zoomStep++ else zoomStep=(zoomStep-1).coerceAtLeast(0)
-    handler.postDelayed({ scan() },moveDelayMs)
-   }
-   override fun onCancelled(gestureDescription:GestureDescription?) { fail("Жест масштаба прерван") }
-  },handler)) fail("Жест масштаба не принят")
  }
  // Sample a fixed central rectangle. UI and animated edge controls are excluded.
  private fun sampleMap(bitmap:Bitmap):IntArray {
@@ -397,7 +673,7 @@ class ScannerService : AccessibilityService() {
   // Nor is it proof of a stationary camera. Mark it explicitly as uncertain.
   return Motion("uncertain",score=best,baseline=baseline)
  }
- private fun startNextRow(sample:IntArray,reason:String) {
+ private fun startNextRow(sample:Snapshot,reason:String) {
   report(reason)
   edgeProbeStage=0; edgeEvidence=0; probeReverseChanged=false
   previousSample=sample; checkingMovement=true; verticalCheck=true
@@ -405,14 +681,30 @@ class ScannerService : AccessibilityService() {
   report("Один вертикальный шаг на 22% экрана; после него смена направления")
   performSwipe(.50f,.61f,.50f,.39f)
  }
- private fun navigate(sample:IntArray) {
+ private fun navigate(sample:Snapshot) {
   if(!running) return
   if(checkingMovement && previousSample!=null) {
    val wasProbe=edgeProbeStage
    val wasVertical=verticalCheck
-   val m=measureMotion(previousSample!!,sample,wasVertical)
+   val before=checkNotNull(previousSample)
+   val registered=sample.measured[before.map]
+   val m=if(registered!=null) {
+       val c=FocusPoint(width*.5f,height*.5f); val p=registered.map(c)
+       val dx=p.x-c.x; val dy=p.y-c.y
+       val swipe=dispatchedSwipe
+       val along=if(wasVertical) dy else dx; val cross=if(wasVertical) dx else dy
+       val expected=if(swipe==null) 0f else if(wasVertical) swipe.y2-swipe.y1 else swipe.x2-swipe.x1
+       val kind=when {
+           cameraAligned(registered,width,height) -> "still"
+           abs(registered.scale-1f)<.06f && along*expected>0 && abs(along)>width*.018f &&
+               abs(cross)<maxOf(width*.025f,abs(along)*.42f) -> "moved"
+           else -> "uncertain"
+       }
+       Motion(kind,dx.roundToInt(),dy.roundToInt(),baseline=difference(before.colors,sample.colors))
+   } else measureMotion(before.colors,sample.colors,wasVertical)
    checkingMovement=false; previousSample=null; verticalCheck=false
-   report("${if(wasVertical) "Вертикаль" else "Горизонталь"}: ${m.kind}; сдвиг (${m.dx},${m.dy}); разница ${"%.3f".format(Locale.US,m.baseline)}; совпадение ${"%.3f".format(Locale.US,m.score)}")
+   val detail=if(registered==null) "отсчётов, разница ${"%.3f".format(Locale.US,m.baseline)}" else "px, ориентиров ${registered.support}"
+   report("${if(wasVertical) "Вертикаль" else "Горизонталь"}: ${m.kind} · сдвиг (${m.dx},${m.dy}) $detail")
    if(!diagnosticMode && wasProbe==3) {
     if(m.kind=="moved") {
      report("Контроль неопределённого движения: обратный жест работает; возвращаю положение")
@@ -559,7 +851,7 @@ class ScannerService : AccessibilityService() {
    stopWith("Ошибка навигации: лимит шагов; край не подтверждён")
    return
   }
-  report(if(diagnosticMode) "Диагностика: горизонтальный тест ${diagnosticChecks+1}/3" else "Сканирую: полоса ${row+1}, подтверждено $rowSteps, ${if(direction==1) "вправо" else "влево"}")
+  report(if(diagnosticMode) "Диагностика: горизонтальный тест ${diagnosticChecks+1}/3" else "Сканирую: полоса ${row+1}, подтверждено $rowSteps, ${if(direction==1) "вправо" else "влево"}${if(totalUnresolved>0) " · неподтверждённых $totalUnresolved" else ""}")
   previousSample=sample; checkingMovement=true; verticalCheck=false
   attemptedHorizontalMoves++
   swipeAlongRow(direction)
@@ -575,14 +867,17 @@ class ScannerService : AccessibilityService() {
  }
  private fun performSwipe(x1:Float,y1:Float,x2:Float,y2:Float) {
   if(!running) return
+  if(planNavigation) { nextSwipe=Swipe(x1,y1,x2,y2); return }
+  dispatchedSwipe=Swipe(x1,y1,x2,y2)
+  val id=runId
   val path=Path().apply { moveTo(width*x1,height*y1); lineTo(width*x2,height*y2) }
   val gesture=GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path,0,500)).build()
   report("Жест: отправка (${"%.2f".format(Locale.US,x1)},${"%.2f".format(Locale.US,y1)}) → (${"%.2f".format(Locale.US,x2)},${"%.2f".format(Locale.US,y2)})")
   val accepted=dispatchGesture(gesture,object:GestureResultCallback() {
    override fun onCompleted(gestureDescription:GestureDescription?) {
-    if(running) { report("Жест: выполнен системой"); handler.postDelayed({ scan() },moveDelayMs) }
+    if(running && id==runId) { report("Жест: выполнен системой"); schedule(moveDelayMs) }
    }
-   override fun onCancelled(gestureDescription:GestureDescription?) { if(running) fail("Жест прерван системой") }
+   override fun onCancelled(gestureDescription:GestureDescription?) { if(running && id==runId) fail("Жест прерван системой") }
   },handler)
   if(!accepted) fail("Жест не принят системой")
  }

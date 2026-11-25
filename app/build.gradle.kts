@@ -1,7 +1,11 @@
 plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
 android { namespace = "com.safemaster.lastasylum"; compileSdk = 35
- defaultConfig { applicationId = "com.safemaster.lastasylum"; minSdk = 30; targetSdk = 32; versionCode = 18; versionName = "0.9.0-test" }
+ defaultConfig { applicationId = "com.safemaster.lastasylum"; minSdk = 30; targetSdk = 32; versionCode = 20; versionName = "0.9.2-test" }
  compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
  kotlinOptions { jvmTarget = "17" }
 }
-dependencies { implementation("com.google.mlkit:text-recognition:16.0.1") }
+dependencies {
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+    implementation("cz.adaptech.tesseract4android:tesseract4android:4.9.0")
+    testImplementation("junit:junit:4.13.2")
+}
